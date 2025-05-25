@@ -112,9 +112,11 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
     @Inject
     lateinit var appJson: Json
+
     private var mInterface: ParcelFileDescriptor? = null
     private var isRunning = false
     private lateinit var process: Process
+
     private var elapsedTime = 0L
     private var lastQueryTime = 0L
     private var mBuilder: NotificationCompat.Builder? = null
@@ -137,7 +139,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
 
-     inner class CoreCallback : CoreCallbackHandler {
+    inner class CoreCallback : CoreCallbackHandler {
         /**
          * Called when V2Ray core starts up.
          * @return 0 for success, any other value for failure.
@@ -194,7 +196,6 @@ class V2RayVpnService : VpnService(), ServiceControl {
                 network: Network,
                 networkCapabilities: NetworkCapabilities
             ) {
-                // it's a good idea to refresh capabilities
                 setUnderlyingNetworks(arrayOf(network))
             }
 
@@ -206,27 +207,10 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
     override fun onCreate() {
         super.onCreate()
-        connectivity.registerNetworkCallback(defaultNetworkRequest, defaultNetworkCallback)
         val policy = StrictMode.ThreadPolicy.Builder().permitAll().build()
         StrictMode.setThreadPolicy(policy)
-        Seq.setContext(applicationContext)
-        Libv2ray.initCoreEnv(Utils.userAssetPath(this.applicationContext), Utils.getDeviceIdForXUDPBaseKey())
-
-
-        try {
-            val mFilter = IntentFilter(AppConfig.BROADCAST_ACTION_SERVICE)
-            mFilter.addAction(Intent.ACTION_SCREEN_ON)
-            mFilter.addAction(Intent.ACTION_SCREEN_OFF)
-            mFilter.addAction(Intent.ACTION_USER_PRESENT)
-            ContextCompat.registerReceiver(
-                this@V2RayVpnService,
-                messageReceiver,
-                mFilter,
-                Utils.receiverFlags()
-            )
-        } catch (e: Exception) {
-            Timber.tag(ANG_PACKAGE).d(e.toString())
-        }
+        Seq.setContext(this.applicationContext)
+        Libv2ray.initCoreEnv(Utils.userAssetPath(this), Utils.getDeviceIdForXUDPBaseKey())
     }
 
     override fun onRevoke() {
@@ -234,43 +218,38 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
     override fun onDestroy() {
+        super.onDestroy()
         Timber.d("destroy vpn")
         cancelNotification()
-        serviceScope.cancel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            try {
-                connectivity.unregisterNetworkCallback(defaultNetworkCallback)
-            } catch (ignored: Exception) {
-                ignored.printStackTrace()
-            }
-        }
-        try {
-            this.unregisterReceiver(messageReceiver)
-        } catch (e: Exception) {
-            Timber.tag(ANG_PACKAGE).d(e.toString())
-        }
-        super.onDestroy()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Timber.d("service start command ${intent?.action}")
         when (intent?.action) {
             State.START.toString() -> {
-                startV2rayPoint()
+                if (startCoreLoop()) {
+                    startService()
+                }
                 return START_STICKY
             }
 
             State.STOP.toString() -> {
                 if (isRunning) {
-                    stopV2Ray()
+                    stopV2Ray(true)
                 }
                 return START_NOT_STICKY
             }
 
             State.RESTART.toString() -> {
-                if (isRunning) stopV2Ray()
-                startV2rayPoint()
-                return START_STICKY
+                return if (isRunning) {
+                    stopV2Ray(true)
+                    START_NOT_STICKY
+                } else {
+                    if (startCoreLoop()) {
+                        startService()
+                    }
+                    START_STICKY
+                }
             }
 
             State.CHECK.toString() -> {
@@ -283,9 +262,15 @@ class V2RayVpnService : VpnService(), ServiceControl {
             }
 
             State.WIDGET.toString() -> {
-                if (isRunning) stopV2Ray()
-                else startV2rayPoint()
-                return START_STICKY
+                return if (isRunning) {
+                    stopV2Ray(true)
+                    START_NOT_STICKY
+                } else {
+                    if (startCoreLoop()) {
+                        startService()
+                    }
+                    START_STICKY
+                }
             }
 
             State.TRAFFIC.toString() -> {
@@ -304,7 +289,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
     override fun startService() {
-
+        setup()
     }
 
     override fun stopService() {
@@ -320,55 +305,131 @@ class V2RayVpnService : VpnService(), ServiceControl {
         super.attachBaseContext(newBase)
     }
 
-    private suspend fun setup() {
+
+    fun startCoreLoop(): Boolean {
+        if (isRunning) {
+            Timber.d("amir -1")
+
+            return false
+        }
+        Timber.d("amir - 2")
+
+        val isLogged  = runBlocking { userPref.isLogged() }
+        if(!isLogged) return false
+
         Timber.d("amir")
+        var selectedConfig = appPref.getSelectedConfig() ?: run {
+            return false
+        }
+        Timber.d("amir2")
+
+        try {
+            val mFilter = IntentFilter(AppConfig.BROADCAST_ACTION_SERVICE)
+            mFilter.addAction(Intent.ACTION_SCREEN_ON)
+            mFilter.addAction(Intent.ACTION_SCREEN_OFF)
+            mFilter.addAction(Intent.ACTION_USER_PRESENT)
+            ContextCompat.registerReceiver(this, messageReceiver, mFilter, Utils.receiverFlags())
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to register broadcast receiver")
+            return false
+        }
+
+        Timber.d("amir3")
+
+        val jsonConfig = selectedConfig.first
+        notificationTitle = selectedConfig.second
+        MessageUtil.sendMsg2UI(this, AppConfig.MSG_STATE_RUNNING, "")
+        val config =
+            convertV2RayConfigToProfileItem(appJson.parseToJsonElement(jsonConfig).jsonObject)
+        currentConfig = config
+
+        Timber.d("amir4")
+
+        try {
+            coreController.startLoop(jsonConfig)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to start Core loop")
+            return false
+        }
+
+        Timber.d("amir5")
+
+        if (coreController.isRunning == false) {
+            MessageUtil.sendMsg2UI(this, AppConfig.MSG_STATE_START_FAILURE, "")
+            cancelNotification()
+            return false
+        }
+
+        Timber.d("amir6")
+
+        try {
+            elapsedTime = System.currentTimeMillis()
+            initTrafficTimer()
+            MessageUtil.sendMsg2UI(
+                this@V2RayVpnService,
+                AppConfig.MSG_STATE_START_SUCCESS,
+                Pair(0L, Pair(downloadTraffic, uploadTraffic))
+            )
+            showNotification()
+
+//            PluginUtil.runPlugin(service, config, result.socksPort)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to startup service")
+            return false
+        }
+        Timber.d("amir7")
+
+        return true
+    }
+
+    fun stopCoreLoop(): Boolean {
+
+        if (coreController.isRunning) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    coreController.stopLoop()
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to stop V2Ray loop")
+                }
+            }
+        }
+
+        MessageUtil.sendMsg2UI(this, AppConfig.MSG_STATE_STOP_SUCCESS, "")
+        cancelNotification()
+
+        try {
+            unregisterReceiver(messageReceiver)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to unregister broadcast receiver")
+        }
+        PluginUtil.stopPlugin()
+        return true
+    }
+
+    private fun setup() {
         val prepare = prepare(this)
         if (prepare != null) {
             return
         }
 
-        // If the old interface has exactly the same parameters, use it!
-        // Configure a builder while parsing the parameters.
+        if (setupVpnService() != true) {
+            return
+        }
+
+        runTun2socks()
+    }
+
+    private fun setupVpnService(): Boolean {
+
         val builder = Builder()
-        //val enableLocalDns = defaultDPreference.getPrefBoolean(AppConfig.PREF_LOCAL_DNS_ENABLED, false)
 
         builder.setMtu(VPN_MTU)
         builder.addAddress(PRIVATE_VLAN4_CLIENT, 30)
-        //builder.addDnsServer(PRIVATE_VLAN4_ROUTER)
-//        val bypassLan = SettingsManager.routingRulesetsBypassLan()
-//        if (bypassLan) {
-//            resources.getStringArray(R.array.bypass_private_ip_address).forEach {
-//                val addr = it.split('/')
-//                builder.addRoute(addr[0], addr[1].toInt())
-//            }
-//        } else {
         builder.addRoute("0.0.0.0", 0)
-//        }
-
-//        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) == true) {
-//            builder.addAddress(PRIVATE_VLAN6_CLIENT, 126)
-//            if (bypassLan) {
-//                builder.addRoute("2000::", 3) //currently only 1/8 of total ipV6 is in use
-//            } else {
-//                builder.addRoute("::", 0)
-//            }
-//        }
-
-//        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED) == true) {
-//            builder.addDnsServer(PRIVATE_VLAN4_ROUTER)
-//        } else {
-//        Utils.getVpnDnsServers()
-//            .forEach {
-//                if (Utils.isPureIpAddress(it)) {
-//                    builder.addDnsServer(it)
-//                }
-//            }
-//        }
-
         builder.setSession(currentConfig?.remarks.toString())
 
         val selfPackageName = BuildConfig.APPLICATION_ID
-        serviceScope.async {
+        runBlocking {
             appPref.getIgnoreApps().let {
                 Timber.d("apps ->  $it")
                 if (it.isEmpty()) builder.addDisallowedApplication(selfPackageName)
@@ -376,31 +437,12 @@ class V2RayVpnService : VpnService(), ServiceControl {
                     builder.addDisallowedApplication(app)
                 }
             }
-        }.await()
-//        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PER_APP_PROXY)) {
-//            val apps = MmkvManager.decodeSettingsStringSet(AppConfig.PREF_PER_APP_PROXY_SET)
-//            val bypassApps = MmkvManager.decodeSettingsBool(AppConfig.PREF_BYPASS_APPS)
-//            //process self package
-//            if (bypassApps) apps?.add(selfPackageName) else apps?.remove(selfPackageName)
-//            apps?.forEach {
-//                try {
-//                    if (bypassApps)
-//                        builder.addDisallowedApplication(it)
-//                    else
-//                        builder.addAllowedApplication(it)
-//                } catch (e: PackageManager.NameNotFoundException) {
-//                    Log.d(ANG_PACKAGE, "setup error : --${e.localizedMessage}")
-//                }
-//            }
-//        } else {
-//            builder.addDisallowedApplication(selfPackageName)
-//        }
+        }
 
-        // Close the old interface since the parameters have been changed.
         try {
             mInterface?.close()
         } catch (ignored: Exception) {
-            // ignored
+            Timber.d(ignored)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -413,27 +455,18 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false)
-//            if (MmkvManager.decodeSettingsBool(AppConfig.PREF_APPEND_HTTP_PROXY)) {
-//                builder.setHttpProxy(
-//                    ProxyInfo.buildDirectProxy(
-//                        LOOPBACK,
-//                        SettingsManager.getHttpPort()
-//                    )
-//                )
-//            }
         }
 
-        // Create a new interface using the builder and save the parameters.
         try {
             mInterface = builder.establish()!!
             isRunning = true
-            runTun2socks()
+            return true
         } catch (e: Exception) {
             Timber.e(e)
-            // non-nullable lateinit var
-            e.printStackTrace()
             stopV2Ray()
         }
+        return false
+
     }
 
     private fun runTun2socks() {
@@ -455,19 +488,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
             "notice"
         )
 
-//        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6)) {
-//            cmd.add("--netif-ip6addr")
-//            cmd.add(PRIVATE_VLAN6_ROUTER)
-//        }
-//        if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED)) {
-//            val localDnsPort = Utils.parseInt(
-//                MmkvManager.decodeSettingsString(AppConfig.PREF_LOCAL_DNS_PORT),
-//                AppConfig.PORT_LOCAL_DNS.toInt()
-//            )
-//            cmd.add("--dnsgw")
-//            cmd.add("$LOOPBACK:${localDnsPort}")
-//        }
-        Timber.tag(packageName).d("amir ${cmd.toString()}")
+        Timber.d("cmd  $cmd")
 
         try {
             val proBuilder = ProcessBuilder(cmd)
@@ -476,26 +497,26 @@ class V2RayVpnService : VpnService(), ServiceControl {
                 .directory(applicationContext.filesDir)
                 .start()
             Thread {
-                Timber.tag(packageName).d("$TUN2SOCKS check")
+                Timber.d("$TUN2SOCKS check")
                 process.waitFor()
-                Timber.tag(packageName).d("$TUN2SOCKS exited")
+                Timber.d("$TUN2SOCKS exited")
                 if (isRunning) {
-                    Timber.tag(packageName).d("$TUN2SOCKS restart")
+                    Timber.d("$TUN2SOCKS restart")
                     runTun2socks()
                 }
             }.start()
-            Timber.tag(packageName).d(process.toString())
+            Timber.d(process.toString())
 
             sendFd()
         } catch (e: Exception) {
-            Timber.tag(packageName).d(e.toString())
+            Timber.d(e, "Failed to start $TUN2SOCKS process")
         }
     }
 
     private fun sendFd() {
         val fd = mInterface?.fileDescriptor
         val path = File(applicationContext.filesDir, "sock_path").absolutePath
-        Timber.tag(packageName).d(path)
+        Timber.d(path)
 
         CoroutineScope(Dispatchers.IO).launch {
             var tries = 0
@@ -514,7 +535,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
                 }
                 break
             } catch (e: Exception) {
-                Timber.tag(packageName).d(e.toString())
+                Timber.d(e, "Failed to send file descriptor, try: $tries")
                 if (tries > 5) break
                 tries += 1
             }
@@ -523,23 +544,27 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
     private fun stopV2Ray(isForced: Boolean = true) {
         isRunning = false
-        try {
-            Timber.d("tun2socks destroy")
-            process.destroy()
-        } catch (e: Exception) {
-            Timber.d(e.toString())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                connectivity.unregisterNetworkCallback(defaultNetworkCallback)
+            } catch (ignored: Exception) {
+                // ignored
+            }
         }
 
-        stopV2rayPoint()
+        try {
+            Timber.i("$TUN2SOCKS destroy")
+            process.destroy()
+        } catch (e: Exception) {
+            Timber.e(
+                e, "Failed to destroy $TUN2SOCKS process"
+            )
+        }
+
+        stopCoreLoop()
 
         if (isForced) {
-            //stopSelf has to be called ahead of mInterface.close(). otherwise v2ray core cannot be stooped
-            //It's strage but true.
-            //This can be verified by putting stopself() behind and call stopLoop and startLoop
-            //in a row for several times. You will find that later created v2ray core report port in use
-            //which means the first v2ray core somehow failed to stop and release the port.
             stopSelf()
-
             try {
                 mInterface?.close()
             } catch (ignored: Exception) {
@@ -559,106 +584,6 @@ class V2RayVpnService : VpnService(), ServiceControl {
         }
     }
 
-    fun startV2rayPoint() {
-        serviceScope.launch(Dispatchers.IO) {
-            if (!userPref.isLogged()) {
-                stopV2Ray()
-                return@launch
-            }
-            var selectedConfig = appPref.getSelectedConfig() ?: run {
-                stopV2Ray()
-                return@launch
-            }
-            val jsonConfig = selectedConfig.first
-            notificationTitle = selectedConfig.second
-            MessageUtil.sendMsg2UI(this@V2RayVpnService, AppConfig.MSG_STATE_RUNNING, "")
-            val config =
-                convertV2RayConfigToProfileItem(appJson.parseToJsonElement(jsonConfig).jsonObject)
-            if (coreController.isRunning) {
-                MessageUtil.sendMsg2UI(this@V2RayVpnService, AppConfig.MSG_STATE_START, "")
-                return@launch
-            }
-
-            currentConfig = config
-
-            try {
-                Timber.e("Started loop")
-                coreController.startLoop(jsonConfig)
-            } catch (e: Exception) {
-                Timber.e(e, "Failed to start Core loop")
-            }
-
-            if (coreController.isRunning) {
-                elapsedTime = System.currentTimeMillis()
-                initTrafficTimer()
-                MessageUtil.sendMsg2UI(
-                    this@V2RayVpnService,
-                    AppConfig.MSG_STATE_START_SUCCESS,
-                    Pair(0L, Pair(downloadTraffic, uploadTraffic))
-                )
-                showNotification()
-                setup()
-//                PluginUtil.runPlugin(this@V2RayVpnService, jsonConfig, domainPort)
-            } else {
-                MessageUtil.sendMsg2UI(this@V2RayVpnService, AppConfig.MSG_STATE_START_FAILURE, "")
-                cancelNotification()
-            }
-        }
-
-    }
-
-    fun stopV2rayPoint() {
-
-        if (coreController.isRunning) {
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    coreController.stopLoop()
-                } catch (e: Exception) {
-                    Timber.tag(ANG_PACKAGE).d(e.toString())
-                }
-            }
-        }
-
-        MessageUtil.sendMsg2UI(this, AppConfig.MSG_STATE_STOP_SUCCESS, "")
-        cancelNotification()
-        trafficJob?.cancel()
-
-        PluginUtil.stopPlugin()
-    }
-
-    private fun measureV2rayDelay() {
-        CoroutineScope(Dispatchers.IO).launch {
-//            var time = -1L
-//            var errStr = ""
-//            if (v2rayPoint.isRunning) {
-//                try {
-//                    time = v2rayPoint.measureDelay(Utils.getDelayTestUrl())
-//                } catch (e: Exception) {
-//                    Timber.tag(ANG_PACKAGE).d("measureV2rayDelay: $e")
-//                    errStr = e.message?.substringAfter("\":") ?: "empty message"
-//                }
-//                if (time == -1L) {
-//                    try {
-//                        time = v2rayPoint.measureDelay(Utils.getDelayTestUrl(true))
-//                    } catch (e: Exception) {
-//                        Timber.tag(ANG_PACKAGE).d("measureV2rayDelay: $e")
-//                        errStr = e.message?.substringAfter("\":") ?: "empty message"
-//                    }
-//                }
-//            }
-//            val result = if (time == -1L) {
-//                this@V2RayVpnService.getString(R.string.connection_test_error)
-//            } else {
-//                this@V2RayVpnService.getString(R.string.connection_test_available)
-//            }
-//
-//            MessageUtil.sendMsg2UI(
-//                this@V2RayVpnService,
-//                AppConfig.MSG_MEASURE_DELAY_SUCCESS,
-//                result
-//            )
-        }
-    }
 
     private fun showNotification() {
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -951,12 +876,17 @@ class V2RayVpnService : VpnService(), ServiceControl {
             val state = intent?.getStringExtra("state")
             Timber.d(state.toString())
             when (state) {
-                State.START.name -> startV2rayPoint()
+                State.START.name -> if (startCoreLoop()) {
+                    startService()
+                }
+
                 State.STOP.name -> stopV2Ray()
                 State.RESTART.name -> {
-                    stopV2Ray()
+                    stopV2Ray(true)
                     Thread.sleep(500L)
-                    startV2rayPoint()
+                    if (startCoreLoop()) {
+                        startService()
+                    }
                 }
 
                 State.TRAFFIC.name -> {
@@ -972,8 +902,13 @@ class V2RayVpnService : VpnService(), ServiceControl {
                 }
 
                 State.WIDGET.name -> {
-                    if (isRunning) stopV2Ray()
-                    else startV2rayPoint()
+                    return if (isRunning) {
+                        stopV2Ray()
+                    } else if (startCoreLoop()) {
+                        startService()
+                    } else {
+
+                    }
                 }
             }
 
@@ -1015,7 +950,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
                 }
 
                 AppConfig.MSG_MEASURE_DELAY -> {
-                    measureV2rayDelay()
+
                 }
             }
 
